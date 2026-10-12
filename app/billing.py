@@ -169,6 +169,24 @@ def grant_credits(api_customer_id: str, amount: int, reason: str, reference: str
     return new_balance
 
 
+def grant_starter_credits(api_customer_id: str) -> int | None:
+    """One-time free credits for a new developer account. Idempotent via
+    the ledger's unique `reference` (see grant_credits), so calling this
+    on every /developers/* request is safe -- only the first call after
+    the account is eligible actually grants. Returns the new balance if
+    it granted, None if disabled or already granted."""
+    if settings.starter_credits <= 0:
+        return None
+    ref = f"starter:{api_customer_id}"
+    with get_cursor(dict_rows=False) as cur:
+        cur.execute("SELECT 1 FROM credit_transactions WHERE reference = %s", (ref,))
+        if cur.fetchone() is not None:
+            return None
+    return grant_credits(
+        api_customer_id, settings.starter_credits, reason="starter_credits", reference=ref
+    )
+
+
 def get_recent_transactions(api_customer_id: str, limit: int = 50) -> list[dict]:
     with get_cursor() as cur:
         cur.execute(

@@ -65,6 +65,16 @@ if not os.getenv("REDIS_URL"):
     )
 
 
+def _parse_origins() -> tuple:
+    """CORS allow-list. CORS_ALLOW_ORIGINS (comma-separated) wins; otherwise
+    only FRONTEND_URL is allowed. Set CORS_ALLOW_ORIGINS=* to re-open it."""
+    raw = os.getenv("CORS_ALLOW_ORIGINS", "")
+    items = [o.strip().rstrip("/") for o in raw.split(",") if o.strip()]
+    if not items:
+        items = [os.getenv("FRONTEND_URL", "http://localhost:3000").strip().rstrip("/")]
+    return tuple(items)
+
+
 @dataclass
 class Settings:
     # Embeddings
@@ -219,7 +229,7 @@ class Settings:
     # API platform -- usage-based billing for third-party developers
     # calling /ingest and /query directly with an API key (see
     # app/api_keys.py, app/billing.py). Logged-in web users (app/auth.py)
-    # are never charged; only requests authenticated via X-API-Key are.
+    # are never charged; only requests authenticated via CODEBASE12-Key are.
     # -----------------------------------------------------------------
 
     # Flat cost of one /query or /query/stream call. Deliberately not
@@ -255,6 +265,63 @@ class Settings:
     billing_cancel_url: str = os.getenv(
         "BILLING_CANCEL_URL", "http://localhost:3000/billing/cancel"
     )
+
+    # -----------------------------------------------------------------
+    # Per-key limits, starter credits, uploads
+    # -----------------------------------------------------------------
+    # Requests per minute allowed for one API key (fixed one-minute
+    # window, counted in Redis). A key can override this with its own
+    # rate_limit_per_min; 0 here means "no default limit".
+    default_key_rate_limit_per_min: int = int(os.getenv("DEFAULT_KEY_RATE_LIMIT_PER_MIN", "60"))
+    # Default monthly credit cap per key (0 = no cap). A key can override.
+    default_key_monthly_credit_cap: int = int(os.getenv("DEFAULT_KEY_MONTHLY_CREDIT_CAP", "0"))
+    # One-time credits granted to a new developer account once its email
+    # is verified (OAuth accounts are verified at signup). 0 disables.
+    starter_credits: int = int(os.getenv("STARTER_CREDITS", "100"))
+    # Hosts /ingest may clone from (comma-separated). Everything else is refused.
+    allowed_git_hosts: tuple = tuple(
+        h.strip().lower()
+        for h in os.getenv("ALLOWED_GIT_HOSTS", "github.com,gitlab.com,bitbucket.org").split(",")
+        if h.strip()
+    )
+    git_clone_timeout_seconds: int = int(os.getenv("GIT_CLONE_TIMEOUT_SECONDS", "300"))
+    # POST /upload limits. Uploads are chunked + embedded inline in the
+    # web process, so keep these modest.
+    max_upload_bytes_total: int = int(os.getenv("MAX_UPLOAD_BYTES_TOTAL", str(5 * 1024 * 1024)))
+    max_upload_files: int = int(os.getenv("MAX_UPLOAD_FILES", "10"))
+
+    # -----------------------------------------------------------------
+    # Abuse protection
+    # -----------------------------------------------------------------
+    cors_allow_origins: tuple = _parse_origins()
+
+    # How many reverse proxies sit in front of the app (Azure App Service /
+    # Container Apps ingress = 1). Used to pick the real client IP out of
+    # X-Forwarded-For without trusting what the client itself put there.
+    # 0 = no proxy, use the socket address.
+    trusted_proxy_hops: int = int(os.getenv("TRUSTED_PROXY_HOPS", "1"))
+
+    # Auth endpoint limits (fixed windows, counted in Redis). 0 disables one.
+    auth_login_ip_limit: int = int(os.getenv("AUTH_LOGIN_IP_LIMIT", "20"))              # attempts / window / IP
+    auth_login_fail_email_limit: int = int(os.getenv("AUTH_LOGIN_FAIL_EMAIL_LIMIT", "8"))  # FAILED attempts / window / email
+    auth_login_window_seconds: int = int(os.getenv("AUTH_LOGIN_WINDOW_SECONDS", "900"))
+    auth_signup_ip_limit: int = int(os.getenv("AUTH_SIGNUP_IP_LIMIT", "5"))
+    auth_signup_window_seconds: int = int(os.getenv("AUTH_SIGNUP_WINDOW_SECONDS", "3600"))
+    auth_resend_ip_limit: int = int(os.getenv("AUTH_RESEND_IP_LIMIT", "10"))
+    auth_resend_email_limit: int = int(os.getenv("AUTH_RESEND_EMAIL_LIMIT", "3"))
+    auth_resend_window_seconds: int = int(os.getenv("AUTH_RESEND_WINDOW_SECONDS", "3600"))
+
+    # Clone size cap in MB, measured on disk while git runs (the clone is
+    # killed the moment it passes this). 0 = unlimited.
+    max_repo_size_mb: int = int(os.getenv("MAX_REPO_SIZE_MB", "300"))
+
+    # Max chunks one ingest job may produce. Billed (API-key) jobs have a hard
+    # cap because the credits for the worst case are held up-front: the hold
+    # is ingest_credit_cost(INGEST_MAX_CHUNKS_BILLED) and the unused part is
+    # refunded when the job ends. Web-login ingests aren't billed, so 0 =
+    # no chunk cap there (the repo size cap above still applies).
+    ingest_max_chunks_billed: int = int(os.getenv("INGEST_MAX_CHUNKS_BILLED", "2000"))
+    ingest_max_chunks: int = int(os.getenv("INGEST_MAX_CHUNKS", "0"))
 
 
 settings = Settings()

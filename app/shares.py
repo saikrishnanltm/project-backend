@@ -43,12 +43,25 @@ def get_share(share_id: str) -> dict | None:
     it. Returns None for an unknown or since-deleted id."""
     with get_cursor() as cur:
         cur.execute(
-            "SELECT id, question, answer, citations, confidence, repo_filter, created_at "
+            "SELECT id, owner_user_id, question, answer, citations, confidence, repo_filter, created_at "
             "FROM shared_answers WHERE id = %s",
             (share_id,),
         )
         row = cur.fetchone()
-    return dict(row) if row else None
+    if not row:
+        return None
+    d = dict(row)
+    owner = d.pop("owner_user_id", None)  # never returned to the public caller
+    try:
+        from app.repos import backfill_citation_links
+        cites = d["citations"]
+        if isinstance(cites, str):
+            import json as _json
+            cites = _json.loads(cites)
+        d["citations"] = backfill_citation_links(owner, d.get("repo_filter"), cites)
+    except Exception:
+        pass
+    return d
 
 
 def delete_share(owner_user_id: str, share_id: str) -> bool:
@@ -62,3 +75,15 @@ def delete_share(owner_user_id: str, share_id: str) -> bool:
             (share_id, owner_user_id),
         )
         return cur.rowcount > 0
+
+
+def list_shares(owner_user_id: str, limit: int = 100) -> list[dict]:
+    """The caller's own live share links, newest first (id + question only
+    -- enough for a "manage my links" list; never other users' shares)."""
+    with get_cursor() as cur:
+        cur.execute(
+            "SELECT id, question, created_at FROM shared_answers "
+            "WHERE owner_user_id = %s ORDER BY created_at DESC LIMIT %s",
+            (owner_user_id, limit),
+        )
+        return [dict(r) for r in cur.fetchall()]

@@ -28,7 +28,7 @@ def main():
     indexer = RepoIndexer()
     print(f"Ingesting '{source}'... (first run also downloads the embedding model, so this may take a minute)")
     try:
-        result = indexer.ingest(source, repo_name=repo_name)
+        result = indexer.ingest(source, repo_name=repo_name, allow_local=True)
     except ValueError as e:
         print(f"Error: {e}")
         sys.exit(1)

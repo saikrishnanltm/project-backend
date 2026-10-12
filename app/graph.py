@@ -28,9 +28,11 @@ from app.retriever import HybridRetriever, RetrievedChunk
 class AgentState(TypedDict, total=False):
     query: str
     repo_filter: str | None
+    collection: str | None
     user_id: str | None
     search_query: str
     needs_retrieval: bool
+    scope: bool  # True => canned "what I can/can't help with" reply, no LLM call
     retrieved: list[RetrievedChunk]
     answer: str
     citations: list[str]
@@ -61,11 +63,47 @@ def _get_retriever() -> HybridRetriever:
     return _retriever
 
 
+SCOPE_REPLY = (
+    "I'm CodeSage -- I answer questions about the code repositories you've indexed, "
+    "and I back every answer with links to the exact files and lines. "
+    "General questions outside your repos aren't what I'm built for, but I can help with "
+    "things like \"How does authentication work in this repo?\", "
+    "\"Where is the payment logic implemented?\" or \"What does this function do?\". "
+    "What would you like to know about your code?"
+)
+
+# Meta / clearly-off-topic questions: answered with SCOPE_REPLY instead of
+# retrieving random excerpts (which used to produce replies like "the
+# excerpts only define CSS styles").
+_SCOPE_RE = re.compile(
+    r"(\byou\b.*\b(anything|something|questions?|topics?)\b.*"
+    r"\b(other\s+than|outside(\s+of)?|besides|apart\s+from|beyond)\s+(this|the|my|that)\b"
+    r"|\byou\b.*\b(general|common)\s+(knowledge\s+)?(question|topic)s?"
+    r"|^(who|what)\s+are\s+you\b|^what\s+(can|do)\s+you\s+(do|answer|help)"
+    r"|^(tell\s+me\s+a\s+joke|what'?s\s+the\s+weather|what\s+is\s+the\s+weather)"
+    r"|^(hi|hello|hey|thanks|thank\s+you)\b[\s!.?]*$)",
+    re.IGNORECASE,
+)
+
+
+def _is_scope_question(query: str) -> bool:
+    return bool(_SCOPE_RE.search(query.strip()))
+
+
 def triage_node(state: AgentState) -> AgentState:
     query = state["query"].strip()
+    if _is_scope_question(query):
+        return {
+            **state, "needs_retrieval": False, "scope": True,
+            "search_query": query, "retry_count": state.get("retry_count", 0),
+        }
     # Simple heuristic triage: greetings/meta questions skip retrieval.
+    # Word-boundary match so "history of X" / "high level view" are NOT
+    # mistaken for the greeting "hi".
     trivial_patterns = ("hi", "hello", "thanks", "who are you", "what can you do")
-    needs_retrieval = not any(query.lower().startswith(p) for p in trivial_patterns)
+    needs_retrieval = not any(
+        re.match(rf"{re.escape(p)}\b", query.lower()) for p in trivial_patterns
+    )
 
     search_query = query
     if needs_retrieval and _looks_like_followup(query):
@@ -122,6 +160,7 @@ def retrieve_node(state: AgentState) -> AgentState:
         repo_filter=state.get("repo_filter"),
         user_id=state.get("user_id"),
         top_k=settings.top_k_final,
+        collection=state.get("collection"),
     )
     return {**state, "retrieved": chunks}
 
@@ -140,7 +179,11 @@ _GROUNDED_SYSTEM_PROMPT = (
     "If the excerpts don't contain the answer, say so plainly instead of guessing. "
     "Earlier turns in this conversation are provided for context (e.g. resolving "
     "'it'/'that' or avoiding repeating yourself) -- the excerpts below, not the "
-    "earlier turns, are still your only source for facts about the code."
+    "earlier turns, are still your only source for facts about the code. "
+    "If the question isn't about the code at all (general knowledge, chit-chat, "
+    "or asking what you can do), do NOT describe the excerpts or their styling: "
+    "reply briefly and kindly that you're CodeSage, that you answer questions about "
+    "the user's indexed repositories, and suggest one or two example code questions."
 )
 
 
@@ -169,6 +212,9 @@ def generate_node(state: AgentState) -> AgentState:
             "citations": [],
         }
 
+    if state.get("scope"):
+        return {**state, "answer": SCOPE_REPLY, "citations": []}
+
     if not state.get("needs_retrieval", True):
         messages = _build_messages(state, _TRIVIAL_SYSTEM_PROMPT, state["query"])
         answer = _call_llm(messages)
@@ -179,8 +225,26 @@ def generate_node(state: AgentState) -> AgentState:
     messages = _build_messages(state, _GROUNDED_SYSTEM_PROMPT, user)
     answer = _call_llm(messages)
 
-    citations = [c.citation for c in chunks]
+    citations = _citations_with_links(chunks)
     return {**state, "answer": answer, "citations": citations}
+
+
+CITATION_LINK_SEP = " @@ "
+
+
+def _citations_with_links(chunks) -> list[str]:
+    """'file:1-9 (name)' plus ' @@ <github url>' when the repo is a GitHub
+    ingest. Frontend splits on the separator; old rows without it still
+    render as plain text."""
+    from app.repos import github_blob_url
+    cache: dict = {}
+    out = []
+    for c in chunks:
+        m = c.metadata or {}
+        url = github_blob_url(m.get("user_id"), m.get("repo"), m.get("file_path"),
+                              m.get("start_line"), m.get("end_line"), cache)
+        out.append(c.citation + (CITATION_LINK_SEP + url if url else ""))
+    return out
 
 
 def verify_node(state: AgentState) -> AgentState:
@@ -294,11 +358,12 @@ def ask(
     repo_filter: str | None = None,
     user_id: str | None = None,
     history: list[dict] | None = None,
+    collection: str | None = None,
 ) -> AgentState:
     graph = get_graph()
     return graph.invoke({
         "query": query, "repo_filter": repo_filter, "user_id": user_id,
-        "history": history or [],
+        "history": history or [], "collection": collection,
     })
 
 
@@ -307,6 +372,7 @@ def ask_stream(
     repo_filter: str | None = None,
     user_id: str | None = None,
     history: list[dict] | None = None,
+    collection: str | None = None,
 ) -> Iterator[dict]:
     """Streaming counterpart to ask() -- yields dicts of the shape
     {"type": "token", "text": ...} as the answer is generated, then
@@ -328,10 +394,15 @@ def ask_stream(
     high/medium/low signal either way, just without the retry."""
     state: AgentState = {
         "query": query, "repo_filter": repo_filter, "user_id": user_id,
-        "history": history or [], "retry_count": 0,
+        "history": history or [], "retry_count": 0, "collection": collection,
     }
     state = triage_node(state)
     state = retrieve_node(state)
+
+    if state.get("scope"):
+        yield {"type": "token", "text": SCOPE_REPLY}
+        yield {"type": "done", "answer": SCOPE_REPLY, "citations": [], "confidence": "high"}
+        return
 
     chunks = state.get("retrieved", [])
     if not chunks and state.get("needs_retrieval", True):
@@ -347,7 +418,7 @@ def ask_stream(
         context = _build_context_block(chunks)
         user = f"Question: {state['query']}\n\nCode excerpts:\n{context}"
         messages = _build_messages(state, _GROUNDED_SYSTEM_PROMPT, user)
-        citations = [c.citation for c in chunks]
+        citations = _citations_with_links(chunks)
 
     answer_parts: list[str] = []
     for delta in _call_llm_stream(messages):

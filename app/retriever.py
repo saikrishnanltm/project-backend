@@ -40,8 +40,11 @@ class HybridRetriever:
             embedding_function=self.embedding_fn,
         )
 
-    def _dense_search(self, query: str, k: int, repo_filter: str | None, user_id: str | None) -> list[str]:
+    def _dense_search(self, query: str, k: int, repo_filter: str | None, user_id: str | None,
+                      collection: str | None = None) -> list[str]:
         conditions = []
+        if collection:
+            conditions.append({"collection": collection})
         if repo_filter:
             conditions.append({"repo": repo_filter})
         if user_id:
@@ -57,9 +60,13 @@ class HybridRetriever:
         results = self.collection.query(query_texts=[query], n_results=k, where=where)
         return results["ids"][0] if results["ids"] else []
 
-    def _sparse_search(self, query: str, k: int, repo_filter: str | None, user_id: str | None) -> list[str]:
+    def _sparse_search(self, query: str, k: int, repo_filter: str | None, user_id: str | None,
+                       collection: str | None = None) -> list[str]:
         clauses = ["tsv @@ websearch_to_tsquery('simple', %(query)s)"]
         params: dict = {"query": query, "k": k}
+        if collection:
+            clauses.append("collection = %(collection)s")
+            params["collection"] = collection
         if repo_filter:
             clauses.append("repo = %(repo)s")
             params["repo"] = repo_filter
@@ -85,11 +92,12 @@ class HybridRetriever:
         repo_filter: str | None = None,
         user_id: str | None = None,
         top_k: int | None = None,
+        collection: str | None = None,
     ) -> list[RetrievedChunk]:
         top_k = top_k or settings.top_k_final
 
-        dense_ids = self._dense_search(query, settings.top_k_dense, repo_filter, user_id)
-        sparse_ids = self._sparse_search(query, settings.top_k_sparse, repo_filter, user_id)
+        dense_ids = self._dense_search(query, settings.top_k_dense, repo_filter, user_id, collection)
+        sparse_ids = self._sparse_search(query, settings.top_k_sparse, repo_filter, user_id, collection)
 
         fused_scores: dict[str, float] = {}
         dense_ranks: dict[str, int] = {}

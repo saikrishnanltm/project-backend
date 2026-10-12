@@ -155,23 +155,6 @@ def get_user_by_id(user_id: str) -> dict | None:
         row = cur.fetchone()
     return {"id": row["id"], "email": row["email"], "email_verified": row["email_verified"]} if row else None
 
-def get_connection_status(user_id: str) -> dict:
-    """Which sign-in providers this account has connected -- used by
-    GET /auth/me (main.py) so the frontend's Profile page can show
-    "Connected as <login>" vs. a "Connect GitHub"/"Connect Google" button
-    per provider."""
-    with get_cursor() as cur:
-        cur.execute(
-            "SELECT github_id, github_login, google_id FROM users WHERE id = %s", (user_id,)
-        )
-        row = cur.fetchone()
-    if row is None:
-        return {"github_connected": False, "github_login": None, "google_connected": False}
-    return {
-        "github_connected": row["github_id"] is not None,
-        "github_login": row["github_login"],
-        "google_connected": row["google_id"] is not None,
-    }
 
 def get_user_by_email(email: str) -> dict | None:
     """Used by POST /auth/resend-verification (see main.py) -- kept

@@ -88,28 +88,29 @@ Swagger UI is at `localhost:8000/docs`.
 
 ## Selling API access (usage-based billing)
 
-Third-party developers can use `/ingest` and `/query` without a CodeSage
-login at all, authenticating with an API key instead of a JWT:
+Developers use `/ingest` and `/query` with an API key instead of a JWT.
+Create a CodeSage account, then mint a key from the Developer API page
+(or `POST /developers/api-keys` with your login token):
 
 ```bash
-# 1. Sign up as an API customer (org) -- returns an API key, shown once
-curl -X POST localhost:8000/developers/signup \
-  -H "Content-Type: application/json" \
-  -d '{"org_name": "Acme Dev Tools", "email": "eng@acme.dev"}'
+# 1. Mint an API key (shown once) using your normal login token
+curl -X POST localhost:8000/developers/api-keys \
+  -H "Authorization: Bearer <your-login-token>" -H "Content-Type: application/json" \
+  -d '{"label": "my-integration"}'
 
 # 2. Buy credits (Stripe Checkout) -- see "packs" for pricing
 curl localhost:8000/developers/billing/packs
 curl -X POST localhost:8000/developers/billing/checkout \
-  -H "X-API-Key: cs_live_..." -H "Content-Type: application/json" \
+  -H "CODEBASE12-Key: cbi_..." -H "Content-Type: application/json" \
   -d '{"pack_id": "starter"}'
 # -> {"checkout_url": "https://checkout.stripe.com/..."}, open it and pay
 
-# 3. Use the same /ingest and /query endpoints, with X-API-Key instead of a Bearer token
+# 3. Use the same /ingest and /query endpoints, with CODEBASE12-Key instead of a Bearer token
 curl -X POST localhost:8000/ingest \
-  -H "X-API-Key: cs_live_..." -H "Content-Type: application/json" \
+  -H "CODEBASE12-Key: cbi_..." -H "Content-Type: application/json" \
   -d '{"source": "https://github.com/someuser/somerepo"}'
 curl -X POST localhost:8000/query \
-  -H "X-API-Key: cs_live_..." -H "Content-Type: application/json" \
+  -H "CODEBASE12-Key: cbi_..." -H "Content-Type: application/json" \
   -d '{"question": "Where is the database connection configured?"}'
 ```
 
@@ -118,7 +119,7 @@ curl -X POST localhost:8000/query \
   costs credits proportional to repo size (`INGEST_CREDIT_COST_PER_CHUNKS`),
   deducted after the job completes since the true cost isn't known until
   then. Logged-in web users (email/password or GitHub OAuth) are never
-  charged -- only `X-API-Key` requests are metered. See `app/billing.py`.
+  charged -- only `CODEBASE12-Key` requests are metered. See `app/billing.py`.
 - Credits are prepaid via Stripe Checkout (one-time purchases, not a
   subscription) -- see `app/billing.py`'s `CREDIT_PACKS`. Requires
   `STRIPE_SECRET_KEY` and `STRIPE_WEBHOOK_SECRET` (a webhook endpoint at
@@ -190,3 +191,40 @@ a quick CI check or a live demo of "here's how I verified retrieval quality."
 - BM25 is rebuilt in memory on each ingest (see the docstring in
   `indexer.py`); fine at repo scale, but call that out if asked about
   scaling to a multi-repo index.
+
+## API platform: keys, limits, collections, uploads
+
+**Per-key limits.** Each API key has its own rate limit (requests/minute, counted in
+Redis; over it you get `429` + `Retry-After`) and an optional monthly credit cap (over it
+you get `403`). Set them when creating a key or later with
+`PATCH /developers/api-keys/{id}` (`null` = server default, `0` = unlimited). Defaults:
+`DEFAULT_KEY_RATE_LIMIT_PER_MIN=60`, `DEFAULT_KEY_MONTHLY_CREDIT_CAP=0` (no cap).
+`GET /developers/api-keys` returns `last_used_at` plus usage per key (this UTC month and
+all time). Usage counts *metered* calls: `/query`, `/query/stream`, `/ingest`, `/upload`.
+
+**Starter credits.** New developer accounts get `STARTER_CREDITS` (default 100) once, as
+soon as their email is verified (OAuth accounts are verified at signup). Set it to `0` to
+disable. It is a one-time ledger entry (`starter_credits`), so it can't be granted twice.
+
+**Collections.** Group sources by name. Pass `collection` to `/ingest` or `/upload`
+(created on first use), then pass the same `collection` to `/query` to search only inside
+it. `POST/GET /collections`, `GET/DELETE /collections/{name}`. Re-ingesting a repo without
+`collection` leaves it in its collection.
+
+**Uploads.** `POST /upload` (multipart: `files`, `source_name?`, `collection?`) indexes
+Markdown, text, HTML, PDF, CSV and JSON with a prose-aware chunker (`app/doc_chunker.py`:
+splits on headings and paragraphs; PDF citations use page numbers). An upload becomes a
+source like a repo, so `/repos`, `repo_filter` and `DELETE /repos/{name}` work on it.
+Limits: `MAX_UPLOAD_FILES` (10) and `MAX_UPLOAD_BYTES_TOTAL` (5 MB), indexed inline.
+
+**GitHub Action.** `integrations/github-action/` re-indexes a repo on every release.
+
+New dependencies: `python-multipart`, `pypdf`. The schema changes are additive and applied
+on startup (`init_db`).
+
+Run the new tests with a scratch Postgres + Redis:
+
+```bash
+TEST_DATABASE_URL=postgresql://user:pass@localhost/db TEST_REDIS_URL=redis://localhost:6379/0 \
+  pytest tests/test_api_platform.py tests/test_doc_chunker.py
+```

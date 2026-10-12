@@ -1,0 +1,60 @@
+name: CodeSage re-index
+description: Re-index this repository in CodeSage so answers stay current with your latest release.
+author: CodeSage
+branding:
+  icon: refresh-cw
+  color: green
+
+inputs:
+  api-key:
+    description: CodeSage API key (store it as a repository secret, never in the workflow file).
+    required: true
+  api-url:
+    description: Base URL of your CodeSage backend, e.g. https://api.example.com
+    required: true
+  source:
+    description: Repository URL to index. Defaults to the repository running this workflow.
+    required: false
+    default: ""
+  repo-name:
+    description: Name to index the repo under in CodeSage. Defaults to the repository name.
+    required: false
+    default: ""
+  collection:
+    description: Optional CodeSage collection to keep the repo in.
+    required: false
+    default: ""
+  wait:
+    description: Wait for indexing to finish and fail the step if it fails.
+    required: false
+    default: "true"
+  timeout-minutes:
+    description: How long to wait for indexing when wait is true.
+    required: false
+    default: "30"
+
+outputs:
+  job-id:
+    description: The CodeSage ingest job id.
+    value: ${{ steps.reindex.outputs.job-id }}
+  status:
+    description: "queued, done or error."
+    value: ${{ steps.reindex.outputs.status }}
+  chunks-indexed:
+    description: Number of chunks indexed (when wait is true).
+    value: ${{ steps.reindex.outputs.chunks-indexed }}
+
+runs:
+  using: composite
+  steps:
+    - id: reindex
+      shell: bash
+      env:
+        CODESAGE_API_URL: ${{ inputs.api-url }}
+        CODESAGE_API_KEY: ${{ inputs.api-key }}
+        CODESAGE_SOURCE: ${{ inputs.source != '' && inputs.source || format('{0}/{1}', github.server_url, github.repository) }}
+        CODESAGE_REPO_NAME: ${{ inputs.repo-name != '' && inputs.repo-name || github.event.repository.name }}
+        CODESAGE_COLLECTION: ${{ inputs.collection }}
+        CODESAGE_WAIT: ${{ inputs.wait }}
+        CODESAGE_TIMEOUT_MINUTES: ${{ inputs.timeout-minutes }}
+      run: bash ${{ github.action_path }}/reindex.sh

@@ -1,0 +1,19 @@
+# .github/workflows/codesage-reindex.yml
+name: Re-index in CodeSage
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+jobs:
+  reindex:
+    runs-on: ubuntu-latest
+    steps:
+      # Copy this folder to your own repo (e.g. .github/actions/codesage-reindex)
+      # or publish it as its own action repo and use: your-org/codesage-reindex@v1
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/codesage-reindex
+        with:
+          api-key: ${{ secrets.CODESAGE_API_KEY }}
+          api-url: ${{ vars.CODESAGE_API_URL }}
+          # collection: my-product   # optional

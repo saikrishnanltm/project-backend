@@ -45,3 +45,8 @@ pytest==8.3.3
 # Stripe -- prepaid credit purchases for the third-party API platform
 # (Checkout Sessions + webhook verification). See app/billing.py.
 stripe==11.1.1
+
+# File upload endpoint (multipart/form-data) and PDF text extraction
+# for the document chunker -- see app/main.py POST /upload, app/doc_chunker.py.
+python-multipart==0.0.12
+pypdf==5.1.0

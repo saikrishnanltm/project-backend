@@ -7,8 +7,11 @@ from __future__ import annotations
 import os
 import re
 import shutil
+import signal
 import subprocess
+import hashlib
 import tempfile
+import time
 import uuid
 
 import chromadb
@@ -20,15 +23,26 @@ from app.chroma_client import get_chroma_client
 from app.config import settings
 from app.db import get_cursor
 from app import repos as repo_registry
+from app.sources import check_source, is_remote_source
 
 DEFAULT_CLI_USER_ID = "local-cli"
 
 
 def is_github_url(source: str) -> bool:
-    source = source.strip()
-    return bool(
-        re.match(r"^(https?://|git@)", source) or source.endswith(".git")
-    )
+    return is_remote_source(source)
+
+
+def _dir_size(path: str) -> int:
+    """Bytes on disk under `path` (not following symlinks); tolerant of files
+    that appear/vanish while git is writing."""
+    total = 0
+    for root, _dirs, files in os.walk(path):
+        for f in files:
+            try:
+                total += os.lstat(os.path.join(root, f)).st_size
+            except OSError:
+                pass
+    return total
 
 
 def _clone_repo(repo_url: str, github_token: str | None = None, branch: str | None = None) -> str:
@@ -48,18 +62,71 @@ def _clone_repo(repo_url: str, github_token: str | None = None, branch: str | No
     # whatever the repo's default branch happens to be -- a push to a
     # non-default branch would otherwise be diffed against the wrong
     # commit entirely.
-    cmd = ["git", "clone", "--depth", "1", clone_url, tmp_dir]
+    # "--" stops git treating a hostile clone_url as an option.
+    cmd = ["git", "clone", "--depth", "1"]
     if branch:
-        cmd[4:4] = ["--branch", branch]  # insert right before clone_url
+        cmd += ["--branch", branch]
+    cmd += ["--", clone_url, tmp_dir]
 
-    try:
-        subprocess.run(cmd, check=True, capture_output=True, text=True)
-    except subprocess.CalledProcessError as e:
-        # git's own error output echoes back the URL it tried, which would
-        # otherwise leak the raw token verbatim into whatever surfaces this
-        # ValueError (API error response, logs, etc).
-        stderr = e.stderr.replace(github_token, "***") if github_token else e.stderr
-        raise ValueError(f"git clone failed for '{repo_url}': {stderr.strip()}")
+    env = {**os.environ, "GIT_TERMINAL_PROMPT": "0"}  # never hang on a credential prompt
+    max_bytes = settings.max_repo_size_mb * 1024 * 1024  # 0 = unlimited
+    posix = os.name != "nt"
+
+    def _kill(p: subprocess.Popen) -> None:
+        # git spawns helper processes; kill the whole group so none keeps writing.
+        try:
+            if posix:
+                os.killpg(p.pid, signal.SIGKILL)
+            else:
+                p.kill()
+        except Exception:
+            pass
+        try:
+            p.wait(timeout=10)
+        except Exception:
+            pass
+
+    with tempfile.TemporaryFile(mode="w+") as err_file:
+        proc = subprocess.Popen(
+            cmd, stdout=subprocess.DEVNULL, stderr=err_file, text=True, env=env,
+            start_new_session=posix,
+        )
+        deadline = time.monotonic() + settings.git_clone_timeout_seconds
+        while True:
+            try:
+                rc = proc.wait(timeout=1.0)
+                break
+            except subprocess.TimeoutExpired:
+                pass
+            if time.monotonic() > deadline:
+                _kill(proc)
+                shutil.rmtree(tmp_dir, ignore_errors=True)
+                raise ValueError(
+                    f"git clone timed out after {settings.git_clone_timeout_seconds}s for '{repo_url}'."
+                )
+            if max_bytes and _dir_size(tmp_dir) > max_bytes:
+                _kill(proc)
+                shutil.rmtree(tmp_dir, ignore_errors=True)
+                raise ValueError(
+                    f"Repository is too large: clones are limited to {settings.max_repo_size_mb} MB."
+                )
+
+        if rc != 0:
+            err_file.seek(0)
+            stderr = err_file.read()
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+            # git's own error output echoes back the URL it tried, which would
+            # otherwise leak the raw token verbatim into whatever surfaces this
+            # ValueError (API error response, logs, etc).
+            if github_token:
+                stderr = stderr.replace(github_token, "***")
+            raise ValueError(f"git clone failed for '{repo_url}': {stderr.strip()}")
+
+    if max_bytes and _dir_size(tmp_dir) > max_bytes:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+        raise ValueError(
+            f"Repository is too large: clones are limited to {settings.max_repo_size_mb} MB."
+        )
     return tmp_dir
 
 
@@ -94,6 +161,18 @@ def _iter_repo_files(repo_path: str):
                 yield os.path.join(root, fname)
 
 
+def _scope_ids(docs: list[dict], user_id: str, repo_name: str) -> None:
+    """Namespaces every chunk id by (user, repo). chunker._make_id only
+    hashes (file_path, name, start_line), so two accounts indexing the
+    same repo -- or one account indexing two repos with a README.md --
+    produced IDENTICAL ids, and since chunks.id and the Chroma id are
+    global, the second ingest silently re-assigned the first one's rows
+    (upsert overwrote user_id/repo). Scoping the id fixes that."""
+    for d in docs:
+        raw = f"{user_id}\x00{repo_name}\x00{d['id']}"
+        d["id"] = hashlib.sha1(raw.encode("utf-8")).hexdigest()[:24]
+
+
 class RepoIndexer:
     def __init__(self):
         os.makedirs(settings.chroma_persist_dir, exist_ok=True)  # no-op in networked mode, harmless
@@ -113,18 +192,26 @@ class RepoIndexer:
         repo_name: str | None = None,
         user_id: str | None = None,
         github_token: str | None = None,
+        progress=None,
+        collection: str | None = None,
+        allow_local: bool = False,
+        max_chunks: int | None = None,
     ) -> dict:
+        """allow_local=True is for the trusted CLI scripts only; the API
+        never sets it (see app/sources.py for why)."""
         source = source.strip()
-        if not source:
-            raise ValueError("Please paste a GitHub link or a local repo path.")
+        check_source(source, allow_local=allow_local)
         user_id = user_id or DEFAULT_CLI_USER_ID
 
         if is_github_url(source):
             repo_name = repo_name or _default_repo_name(source)
+            if progress:
+                progress("cloning", 2, "Cloning repository")
             tmp_dir = _clone_repo(source, github_token=github_token)
             try:
                 return self.index_repo(
-                    tmp_dir, repo_name=repo_name, user_id=user_id, source_url=source
+                    tmp_dir, repo_name=repo_name, user_id=user_id, source_url=source,
+                    progress=progress, collection=collection, max_chunks=max_chunks,
                 )
             finally:
                 shutil.rmtree(tmp_dir, ignore_errors=True)
@@ -133,7 +220,10 @@ class RepoIndexer:
             raise ValueError(
                 f"'{source}' doesn't look like a GitHub link or an existing local folder."
             )
-        return self.index_repo(source, repo_name=repo_name, user_id=user_id)
+        return self.index_repo(
+            source, repo_name=repo_name, user_id=user_id, progress=progress, collection=collection,
+            max_chunks=max_chunks,
+        )
 
     def index_repo(
         self,
@@ -141,14 +231,27 @@ class RepoIndexer:
         repo_name: str | None = None,
         user_id: str | None = None,
         source_url: str | None = None,
+        progress=None,
+        collection: str | None = None,
+        max_chunks: int | None = None,
     ) -> dict:
         repo_name = repo_name or os.path.basename(os.path.normpath(repo_path))
         user_id = user_id or DEFAULT_CLI_USER_ID
+        # Re-ingesting without naming a collection keeps the repo where it was.
+        collection = collection or self._repo_collection(repo_name, user_id)
         all_docs = []
         files_seen = 0
 
-        for file_path in _iter_repo_files(repo_path):
+        repo_files = list(_iter_repo_files(repo_path))
+        total_files = max(len(repo_files), 1)
+        if progress:
+            progress("chunking", 10, f"Chunking {len(repo_files)} files")
+
+        for file_path in repo_files:
             files_seen += 1
+            if progress and (files_seen % 5 == 0 or files_seen == total_files):
+                progress("chunking", 10 + int(20 * files_seen / total_files),
+                         f"Chunking files ({files_seen}/{total_files})")
             try:
                 with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
                     source = f.read()
@@ -160,13 +263,25 @@ class RepoIndexer:
                 doc = chunk.to_document()
                 doc["metadata"]["repo"] = repo_name
                 doc["metadata"]["user_id"] = user_id
+                if collection:
+                    doc["metadata"]["collection"] = collection
                 all_docs.append(doc)
+            # Checked per file so an oversized repo is refused before any
+            # embedding work, and before the existing index is deleted below.
+            if max_chunks and len(all_docs) > max_chunks:
+                raise ValueError(
+                    f"Repository is too large to index in one job: it produces more than "
+                    f"{max_chunks} chunks. Index a smaller repo."
+                )
 
+        _scope_ids(all_docs, user_id, repo_name)
         self._delete_repo_chroma(repo_name, user_id=user_id)
         self._delete_repo_chunks_table(repo_name, user_id=user_id)
 
         if all_docs:
-            self._upsert_in_batches(all_docs)
+            self._upsert_in_batches(all_docs, progress=progress)
+            if progress:
+                progress("finalizing", 96, "Saving search index")
             self._upsert_chunks_table(all_docs)
 
         result = {
@@ -174,6 +289,8 @@ class RepoIndexer:
             "files_seen": files_seen,
             "chunks_indexed": len(all_docs),
         }
+        if collection:
+            result["collection"] = collection
 
         # Register/refresh this (user, repo) pairing for incremental
         # re-indexing on push -- only meaningful for a real github.com
@@ -251,6 +368,7 @@ class RepoIndexer:
         upsert-by-id would never touch.
         """
         touched_files = [f for f in changed_files + removed_files if f]
+        collection = self._repo_collection(repo_name, user_id)  # keep the repo in its collection
         new_docs = []
         files_indexed = 0
 
@@ -269,8 +387,11 @@ class RepoIndexer:
                 doc = chunk.to_document()
                 doc["metadata"]["repo"] = repo_name
                 doc["metadata"]["user_id"] = user_id
+                if collection:
+                    doc["metadata"]["collection"] = collection
                 new_docs.append(doc)
 
+        _scope_ids(new_docs, user_id, repo_name)
         if touched_files:
             self._delete_files_chroma(repo_name, user_id, touched_files)
             self._delete_files_chunks_table(repo_name, user_id, touched_files)
@@ -293,14 +414,81 @@ class RepoIndexer:
         metadatas = all_docs.get("metadatas", [])
 
         counts: dict[str, int] = {}
+        colls: dict[str, str | None] = {}
         for m in metadatas:
             repo_name = m.get("repo", "(unknown)")
             counts[repo_name] = counts.get(repo_name, 0) + 1
+            if m.get("collection"):
+                colls[repo_name] = m["collection"]
 
         return [
-            {"repo": repo_name, "chunks_indexed": count}
+            {"repo": repo_name, "chunks_indexed": count, "collection": colls.get(repo_name)}
             for repo_name, count in sorted(counts.items(), key=lambda kv: kv[1], reverse=True)
         ]
+
+    def _repo_collection(self, repo_name: str, user_id: str) -> str | None:
+        with get_cursor(dict_rows=False) as cur:
+            cur.execute(
+                "SELECT collection FROM chunks WHERE user_id = %s AND repo = %s "
+                "AND collection IS NOT NULL LIMIT 1",
+                (user_id, repo_name),
+            )
+            row = cur.fetchone()
+        return row[0] if row else None
+
+    def index_documents(
+        self,
+        files: list[tuple[str, bytes]],
+        source_name: str,
+        user_id: str,
+        collection: str | None = None,
+    ) -> dict:
+        """Chunks uploaded documents (see doc_chunker.py) and indexes them
+        under one source name -- the same (user, repo) slot repos use, so
+        /repos, /query's repo_filter and DELETE /repos/{name} all work on
+        uploads unchanged. Re-uploading under the same source_name
+        replaces what was there. Raises doc_chunker.UnsupportedDocument
+        BEFORE touching the index if any file can't be read, so a bad
+        file never leaves a half-replaced source behind."""
+        from app.doc_chunker import chunk_document
+
+        collection = collection or self._repo_collection(source_name, user_id)
+        docs: list[dict] = []
+        for file_name, data in files:
+            for chunk in chunk_document(file_name, data):
+                doc = chunk.to_document()
+                doc["metadata"]["repo"] = source_name
+                doc["metadata"]["user_id"] = user_id
+                doc["metadata"]["source_type"] = "upload"
+                if collection:
+                    doc["metadata"]["collection"] = collection
+                docs.append(doc)
+
+        _scope_ids(docs, user_id, source_name)
+        self._delete_repo_chroma(source_name, user_id=user_id)
+        self._delete_repo_chunks_table(source_name, user_id=user_id)
+        if docs:
+            self._upsert_in_batches(docs)
+            self._upsert_chunks_table(docs)
+        result = {"repo": source_name, "files_seen": len(files), "chunks_indexed": len(docs)}
+        if collection:
+            result["collection"] = collection
+        return result
+
+    def delete_collection_contents(self, collection: str, user_id: str) -> int:
+        """Deletes every chunk (all sources) in a collection. Returns the chunk count."""
+        where = {"$and": [{"collection": collection}, {"user_id": user_id}]}
+        try:
+            deleted = len(self.collection.get(where=where).get("ids", []))
+            self.collection.delete(where=where)
+        except Exception:
+            deleted = 0
+        with get_cursor(dict_rows=False) as cur:
+            cur.execute(
+                "DELETE FROM chunks WHERE collection = %s AND user_id = %s", (collection, user_id)
+            )
+            deleted = max(deleted, cur.rowcount)
+        return deleted
 
     def delete_repo(self, repo_name: str, user_id: str | None = None) -> int:
         user_id = user_id or DEFAULT_CLI_USER_ID
@@ -350,19 +538,26 @@ class RepoIndexer:
                 (repo_name, user_id, file_paths),
             )
 
-    def _upsert_in_batches(self, docs: list[dict]) -> None:
+    def _upsert_in_batches(self, docs: list[dict], progress=None) -> None:
         try:
             max_batch_size = self.chroma_client.get_max_batch_size()
         except Exception:
             max_batch_size = 100
+        if progress:
+            max_batch_size = min(max_batch_size, 64)  # small batches => smooth progress
 
-        for start in range(0, len(docs), max_batch_size):
+        total = len(docs)
+        for start in range(0, total, max_batch_size):
             batch = docs[start:start + max_batch_size]
             self.collection.upsert(
                 ids=[d["id"] for d in batch],
                 documents=[d["text"] for d in batch],
                 metadatas=[d["metadata"] for d in batch],
             )
+            if progress:
+                done = min(start + len(batch), total)
+                progress("embedding", 30 + int(65 * done / total),
+                         f"Embedding code ({done}/{total} chunks)")
 
     def _upsert_chunks_table(self, docs: list[dict]) -> None:
         rows = [
@@ -375,6 +570,7 @@ class RepoIndexer:
                 d["metadata"]["start_line"],
                 d["metadata"]["end_line"],
                 d["text"],
+                d["metadata"].get("collection"),
             )
             for d in docs
         ]
@@ -384,7 +580,7 @@ class RepoIndexer:
                 cur,
                 """
                 INSERT INTO chunks
-                    (id, user_id, repo, file_path, qualified_name, start_line, end_line, text)
+                    (id, user_id, repo, file_path, qualified_name, start_line, end_line, text, collection)
                 VALUES %s
                 ON CONFLICT (id) DO UPDATE SET
                     user_id = EXCLUDED.user_id,
@@ -393,7 +589,8 @@ class RepoIndexer:
                     qualified_name = EXCLUDED.qualified_name,
                     start_line = EXCLUDED.start_line,
                     end_line = EXCLUDED.end_line,
-                    text = EXCLUDED.text
+                    text = EXCLUDED.text,
+                    collection = EXCLUDED.collection
                 """,
                 rows,
             )

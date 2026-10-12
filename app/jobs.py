@@ -20,12 +20,13 @@ from enum import Enum
 
 from redis import Redis
 from rq import Queue
-from rq.job import Job
+from rq.job import Callback, Job
 from rq.job import JobStatus as RQJobStatus
 
-from app import auth, billing, github_webhooks
+from app import api_keys, auth, billing, github_webhooks
 from app import repos as repo_registry
 from app.config import settings
+from app.db import get_cursor
 from app.indexer import RepoIndexer
 
 _redis: Redis | None = None
@@ -87,7 +88,43 @@ _RQ_STATUS_MAP = {
 }
 
 
-def run_ingest_job(source: str, repo_name: str | None, user_id: str, billed: bool = False) -> dict:
+def _make_progress_reporter():
+    """Returns a callback(stage, percent, detail) that records progress in
+    the RQ job's meta so GET /ingest/status can show it. Throttled so a big
+    repo doesn't hammer Redis; never raises (progress is cosmetic)."""
+    import time as _time
+    try:
+        from rq import get_current_job
+        job = get_current_job()
+    except Exception:
+        job = None
+    if job is None:
+        return None
+    state = {"t": 0.0, "stage": None}
+
+    def report(stage: str, percent: int, detail: str = "") -> None:
+        now = _time.monotonic()
+        if stage == state["stage"] and now - state["t"] < 0.5 and percent < 95:
+            return
+        state["t"], state["stage"] = now, stage
+        try:
+            job.meta["progress"] = {"stage": stage, "percent": int(percent), "detail": detail}
+            job.save_meta()
+        except Exception:
+            pass
+
+    return report
+
+
+def run_ingest_job(
+    source: str,
+    repo_name: str | None,
+    user_id: str,
+    billed: bool = False,
+    collection: str | None = None,
+    api_key_id: str | None = None,
+    reserved_credits: int = 0,
+) -> dict:
     """The actual ingestion work -- this is what a worker process
     (worker.py) executes for a queued job. Returning a dict here is what
     RQ stores as job.result once it marks the job FINISHED; raising marks
@@ -113,11 +150,31 @@ def run_ingest_job(source: str, repo_name: str | None, user_id: str, billed: boo
     negative in the rare large-repo case, rather than refusing to record
     the usage that already happened."""
     github_token = auth.get_github_token(user_id)
+    max_chunks = settings.ingest_max_chunks_billed if billed else settings.ingest_max_chunks
     result = _get_indexer().ingest(
-        source, repo_name=repo_name, user_id=user_id, github_token=github_token
+        source, repo_name=repo_name, user_id=user_id, github_token=github_token,
+        progress=_make_progress_reporter(), collection=collection,
+        max_chunks=max_chunks or None,
     )
 
-    if billed:
+    if billed and reserved_credits > 0:
+        # Credits for the worst case were held when the job was queued (see
+        # main.py's POST /ingest); give back what this repo didn't use.
+        cost = billing.ingest_credit_cost(result.get("chunks_indexed", 0))
+        from rq import get_current_job
+        cur_job = get_current_job()
+        try:
+            _settle_hold(
+                cur_job.id if cur_job else f"nojob:{user_id}:{result.get('repo')}",
+                user_id, api_key_id, reserved_credits, cost,
+                label=str(result.get("repo")), failed=False,
+            )
+            result["credits_charged"] = cost
+            result["credit_balance"] = billing.get_balance(user_id)
+        except Exception as e:
+            print(f"[jobs] Couldn't settle ingest hold for '{user_id}': {e}")
+    elif billed:
+        # Legacy path: job queued before holds existed -- charge afterwards.
         cost = billing.ingest_credit_cost(result.get("chunks_indexed", 0))
         try:
             new_balance = billing.deduct_credits(
@@ -125,6 +182,10 @@ def run_ingest_job(source: str, repo_name: str | None, user_id: str, billed: boo
             )
             result["credits_charged"] = cost
             result["credit_balance"] = new_balance
+            if api_key_id:
+                # Count it against the key's monthly usage. Never refuses:
+                # the work is already done (see api_keys.record_usage).
+                api_keys.record_usage(api_key_id, cost)
         except billing.BillingError as e:
             # api_customer row vanished mid-job (shouldn't happen -- FK
             # cascade would also have deleted this job's own queued
@@ -154,6 +215,48 @@ def run_ingest_job(source: str, repo_name: str | None, user_id: str, billed: boo
             print(f"[jobs] Webhook registration for {owner}/{repo} failed: {e}")
 
     return result
+
+
+def _settle_hold(
+    job_id: str, customer_id: str, api_key_id: str | None,
+    reserved: int, actual: int, label: str, failed: bool,
+) -> None:
+    """Closes out the credits held for an ingest: refunds reserved - actual
+    (all of it when the job failed). Idempotent -- the ledger reference
+    `ingest_settle:<job_id>` is written exactly once, so the success path and
+    the failure callback can never both refund."""
+    ref = f"ingest_settle:{job_id}"
+    with get_cursor(dict_rows=False) as cur:
+        cur.execute("SELECT 1 FROM credit_transactions WHERE reference = %s", (ref,))
+        if cur.fetchone() is not None:
+            return
+    refund = max(reserved - actual, 0)
+    extra = max(actual - reserved, 0)
+    reason = f"ingest_failed_refund:{label}" if failed else f"ingest_settle:{label}"
+    billing.grant_credits(customer_id, refund, reason=reason, reference=ref)
+    if extra:  # can't happen while the chunk cap matches the hold; kept for safety
+        billing.deduct_credits(customer_id, extra, reason=f"ingest_extra:{label}", allow_negative=True)
+    if api_key_id:
+        if failed:
+            api_keys.release_usage(api_key_id, refund)  # also un-counts the request
+        elif refund - extra:
+            api_keys.adjust_usage_credits(api_key_id, -(refund - extra))
+
+
+def ingest_failure_callback(job, connection, type, value, traceback) -> None:
+    """RQ on_failure hook: any failure (exception, timeout, killed worker)
+    returns the credits that were held for this job."""
+    meta = job.meta or {}
+    reserved = int(meta.get("reserved_credits") or 0)
+    if reserved <= 0:
+        return
+    try:
+        _settle_hold(
+            job.id, meta["user_id"], meta.get("api_key_id"), reserved, 0,
+            label=str(meta.get("repo_name") or meta.get("source")), failed=True,
+        )
+    except Exception as e:
+        print(f"[jobs] Couldn't refund ingest hold for job {job.id}: {e}")
 
 
 def run_incremental_ingest_job(indexed_repo_id: str, push_event: dict) -> dict:
@@ -198,7 +301,15 @@ def enqueue_incremental_ingest(indexed_repo_id: str, push_event: dict) -> str:
     return job.id
 
 
-def enqueue_ingest(source: str, repo_name: str | None, user_id: str, billed: bool = False) -> str:
+def enqueue_ingest(
+    source: str,
+    repo_name: str | None,
+    user_id: str,
+    billed: bool = False,
+    collection: str | None = None,
+    api_key_id: str | None = None,
+    reserved_credits: int = 0,
+) -> str:
     """Queues an ingest job and returns its id right away -- the RQ
     equivalent of the old background_tasks.add_task() call in main.py.
     job_timeout is generous (cloning + AST-chunking + CPU embeddings on a
@@ -215,10 +326,18 @@ def enqueue_ingest(source: str, repo_name: str | None, user_id: str, billed: boo
         repo_name,
         user_id,
         billed,
+        collection,
+        api_key_id,
+        reserved_credits,
         job_timeout="30m",
         result_ttl=86400,  # keep the result pollable for a day after it finishes
         failure_ttl=86400,
-        meta={"source": source, "repo_name": repo_name, "user_id": user_id},
+        on_failure=Callback(ingest_failure_callback),
+        meta={
+            "source": source, "repo_name": repo_name, "user_id": user_id,
+            "collection": collection, "api_key_id": api_key_id,
+            "reserved_credits": reserved_credits,
+        },
     )
     return job.id
 
@@ -246,6 +365,7 @@ def get_job_status(job_id: str, user_id: str) -> dict | None:
         "repo_name": job.meta.get("repo_name"),
         "result": job.result if status == JobStatus.DONE else None,
         "error": _format_error(job) if status == JobStatus.ERROR else None,
+        "progress": job.meta.get("progress") if status != JobStatus.DONE else {"stage": "done", "percent": 100, "detail": "Finished"},
         "created_at": _iso(job.created_at),
         "started_at": _iso(job.started_at),
         "finished_at": _iso(job.ended_at),

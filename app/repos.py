@@ -131,3 +131,72 @@ def update_last_commit_sha(indexed_repo_id: str, commit_sha: str) -> None:
             "UPDATE indexed_repos SET last_commit_sha = %s, updated_at = %s WHERE id = %s",
             (commit_sha, time.time(), indexed_repo_id),
         )
+
+
+def github_blob_url(
+    user_id: str | None, repo_name: str | None, file_path: str | None,
+    start_line, end_line, cache: dict | None = None,
+) -> str | None:
+    """Permalink to a cited chunk on GitHub (pinned to the last indexed
+    commit, else HEAD). None for local-folder ingests or unknown repos."""
+    from urllib.parse import quote
+    if not (user_id and repo_name and file_path):
+        return None
+    key = (user_id, repo_name)
+    if cache is not None and key in cache:
+        row = cache[key]
+    else:
+        try:
+            row = get_indexed_repo(user_id, repo_name)
+        except Exception:
+            row = None
+        if cache is not None:
+            cache[key] = row
+    if not row or not row.get("github_owner") or not row.get("github_repo"):
+        return None
+    ref = row.get("last_commit_sha") or "HEAD"
+    path = quote(str(file_path).replace("\\", "/").lstrip("/"), safe="/")
+    url = f"https://github.com/{row['github_owner']}/{row['github_repo']}/blob/{ref}/{path}"
+    try:
+        s, e = int(start_line), int(end_line)
+        url += f"#L{s}" + (f"-L{e}" if e > s else "")
+    except (TypeError, ValueError):
+        pass
+    return url
+
+
+_CITE_RE = re.compile(r"^(?P<path>.+?):(?P<s>\d+)-(?P<e>\d+)(?P<rest>\s+\(.*\))?$")
+
+
+def backfill_citation_links(user_id: str | None, repo_filter: str | None, citations: list[str]) -> list[str]:
+    """Read-time backfill for answers stored before citations carried GitHub
+    links: 'file:1-9 (name)' -> 'file:1-9 (name) @@ <url>'. Nothing is
+    rewritten in the database. Citations already linked, unparseable, or
+    from non-GitHub repos are returned unchanged."""
+    out: list[str] = []
+    cache: dict = {}
+    for c in citations or []:
+        if " @@ " in c:
+            out.append(c)
+            continue
+        m = _CITE_RE.match(c)
+        if not m or not user_id:
+            out.append(c)
+            continue
+        path, s, e = m.group("path"), int(m.group("s")), int(m.group("e"))
+        repo = repo_filter
+        if not repo:
+            try:
+                with get_cursor() as cur:
+                    cur.execute(
+                        "SELECT repo FROM chunks WHERE user_id = %s AND file_path = %s "
+                        "AND start_line = %s AND end_line = %s LIMIT 1",
+                        (user_id, path, s, e),
+                    )
+                    row = cur.fetchone()
+                repo = row["repo"] if row else None
+            except Exception:
+                repo = None
+        url = github_blob_url(user_id, repo, path, s, e, cache) if repo else None
+        out.append(c + " @@ " + url if url else c)
+    return out

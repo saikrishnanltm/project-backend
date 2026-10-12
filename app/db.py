@@ -372,3 +372,43 @@ def init_db() -> None:
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_credit_tx_reference "
             "ON credit_transactions(reference) WHERE reference IS NOT NULL"
         )
+
+        # ---------------------------------------------------------------
+        # Per-key limits + usage. NULL limit columns mean "use the server
+        # default" (see config.py's DEFAULT_KEY_* settings). api_key_usage
+        # is one row per (key, calendar month UTC) and counts METERED
+        # calls (/query, /query/stream, /ingest, /upload) and the credits
+        # they cost -- it is what the monthly cap is enforced against.
+        # ---------------------------------------------------------------
+        cur.execute("ALTER TABLE api_keys ADD COLUMN IF NOT EXISTS rate_limit_per_min INTEGER")
+        cur.execute("ALTER TABLE api_keys ADD COLUMN IF NOT EXISTS monthly_credit_cap BIGINT")
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS api_key_usage (
+                api_key_id TEXT NOT NULL REFERENCES api_keys(id) ON DELETE CASCADE,
+                period TEXT NOT NULL,
+                requests BIGINT NOT NULL DEFAULT 0,
+                credits BIGINT NOT NULL DEFAULT 0,
+                PRIMARY KEY (api_key_id, period)
+            )
+        """)
+
+        # ---------------------------------------------------------------
+        # Named collections: a user-defined group of indexed sources
+        # (repos and uploaded documents). Membership lives on the chunks
+        # themselves (chunks.collection + the same key in Chroma
+        # metadata), so querying a collection is just one more filter.
+        # ---------------------------------------------------------------
+        cur.execute("ALTER TABLE chunks ADD COLUMN IF NOT EXISTS collection TEXT")
+        cur.execute(
+            "CREATE INDEX IF NOT EXISTS idx_chunks_collection ON chunks(user_id, collection)"
+        )
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS collections (
+                id TEXT PRIMARY KEY,
+                user_id TEXT NOT NULL,
+                name TEXT NOT NULL,
+                description TEXT,
+                created_at DOUBLE PRECISION NOT NULL,
+                UNIQUE (user_id, name)
+            )
+        """)
