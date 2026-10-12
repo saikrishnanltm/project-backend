@@ -553,7 +553,6 @@ def get_principal(
     authorization: str | None = Header(default=None),
     x_api_key: str | None = Header(default=None, alias="CODEBASE12-Key"),
     x_api_key_legacy: str | None = Header(default=None, alias="X-API-Key"),
-     x_api_key_legacy: str | None = Header(default=None, alias="X-API-Key"),
 ) -> dict:
     """Accepts EITHER a logged-in user's JWT (Authorization: Bearer ...)
     OR a third-party API key (CODEBASE12-Key: cbi_...). Returns
@@ -567,9 +566,6 @@ def get_principal(
     machine/integration call rather than a browser session carrying a
     stale Authorization header."""
 
-
-    x_api_key = x_api_key or x_api_key_legacy
-    
     x_api_key = x_api_key or x_api_key_legacy
     if x_api_key:
         customer = api_keys.authenticate_api_key(x_api_key)
